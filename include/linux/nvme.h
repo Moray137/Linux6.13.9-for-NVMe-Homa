@@ -68,6 +68,7 @@ enum {
 	NVMF_TRTYPE_FC		= 2,	/* Fibre Channel */
 	NVMF_TRTYPE_TCP		= 3,	/* TCP/IP */
 	NVMF_TRTYPE_LOOP	= 254,	/* Reserved for host usage */
+	NVMF_TRTYPE_HOMA        = 146,  /* Homa Transport */
 	NVMF_TRTYPE_MAX,
 };
 

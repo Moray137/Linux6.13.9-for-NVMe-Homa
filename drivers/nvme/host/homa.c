@@ -25,7 +25,8 @@
 #include "fabrics.h"
 #include "homa.h"
 
-#include "../../../include/linux/printk.h"
+#include <string.h>
+#include <asm-generic/errno-base.h>
 
 struct nvme_tcp_queue;
 
@@ -159,6 +160,9 @@ struct nvme_tcp_queue {
 	size_t			data_remaining;
 	size_t			ddgst_remaining;
 	unsigned int		nr_cqe;
+	// Used for private data path.
+	struct                  homa_recvmsg_args recv_args;
+	struct                  homa_rcvbuf_args rcvbuf_args;
 
 	/* send state */
 	struct nvme_tcp_request *request;
@@ -183,6 +187,8 @@ struct nvme_tcp_queue {
 	void (*state_change)(struct sock *);
 	void (*data_ready)(struct sock *);
 	void (*write_space)(struct sock *);
+	// Used for Homa's sendmsg()
+	struct homa_sendmsg_args send_args;
 };
 
 struct nvme_tcp_ctrl {
@@ -813,26 +819,32 @@ static void nvme_tcp_handle_c2h_term(struct nvme_tcp_queue *queue,
 		"Received C2HTermReq (FES = %s)\n", msg);
 }
 
-static int nvme_tcp_recv_pdu(struct nvme_tcp_queue *queue, struct sk_buff *skb,
-		unsigned int *offset, size_t *len)
+static int nvme_tcp_recv_pdu(struct nvme_tcp_queue *queue)
 {
 	struct nvme_tcp_hdr *hdr;
 	char *pdu = queue->pdu;
-	size_t rcv_len = min_t(size_t, *len, queue->pdu_remaining);
+	//size_t rcv_len = min_t(size_t, *len, queue->pdu_remaining);
 	int ret;
+	struct kvec iov;
+	iov.iov_base = pdu;
+	iov.iov_len = queue->pdu_remaining;
+	// Use non-blocking recvmsg()
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
+	msg.msg_control = &queue->recv_args;
+	msg.msg_controllen = sizeof(queue->recv_args);
 
-	ret = skb_copy_bits(skb, *offset,
-		&pdu[queue->pdu_offset], rcv_len);
-	if (unlikely(ret))
+	ret = kernel_recvmsg(queue->sock, &msg, &iov, 1,
+			iov.iov_len, msg.msg_flags);
+	if (unlikely(ret < 0))
 		return ret;
-
-	queue->pdu_remaining -= rcv_len;
-	queue->pdu_offset += rcv_len;
-	*offset += rcv_len;
-	*len -= rcv_len;
+	queue->pdu_remaining -= ret;
+	queue->pdu_offset += ret;
+	// skb-specific ops
+	// *offset += ret;
+	// *len -= ret;
 	if (queue->pdu_remaining)
 		return 0;
-
+	memcpy(queue->pdu, queue->rcvbuf_args.start, ret);
 	hdr = queue->pdu;
 	if (unlikely(hdr->hlen != sizeof(struct nvme_tcp_rsp_pdu))) {
 		if (!nvme_tcp_recv_pdu_supported(hdr->type))
@@ -1012,37 +1024,7 @@ static int nvme_tcp_recv_ddgst(struct nvme_tcp_queue *queue,
 static int nvme_tcp_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 			     unsigned int offset, size_t len)
 {
-	struct nvme_tcp_queue *queue = desc->arg.data;
-	size_t consumed = len;
-	int result;
 
-	if (unlikely(!queue->rd_enabled))
-		return -EFAULT;
-
-	while (len) {
-		switch (nvme_tcp_recv_state(queue)) {
-		case NVME_TCP_RECV_PDU:
-			result = nvme_tcp_recv_pdu(queue, skb, &offset, &len);
-			break;
-		case NVME_TCP_RECV_DATA:
-			result = nvme_tcp_recv_data(queue, skb, &offset, &len);
-			break;
-		case NVME_TCP_RECV_DDGST:
-			result = nvme_tcp_recv_ddgst(queue, skb, &offset, &len);
-			break;
-		default:
-			result = -EFAULT;
-		}
-		if (result) {
-			dev_err(queue->ctrl->ctrl.device,
-				"receive failed:  %d\n", result);
-			queue->rd_enabled = false;
-			nvme_tcp_error_recovery(&queue->ctrl->ctrl);
-			return result;
-		}
-	}
-
-	return consumed;
 }
 
 static void nvme_tcp_data_ready(struct sock *sk)
@@ -1186,21 +1168,20 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
 	struct nvme_tcp_queue *queue = req->queue;
 	struct nvme_tcp_cmd_pdu *pdu = nvme_tcp_req_cmd_pdu(req);
 	struct bio_vec bvec;
-	struct homa_sendmsg_args send_args;
 	struct msghdr msg = { .msg_flags = MSG_DONTWAIT, };
-	send_args.id = 0;
-	send_args.flags = 0;
-	send_args.completion_cookie = 0;
-	msg.msg_control = &send_args;
-	msg.msg_controllen = sizeof(send_args);
-	/* You won't get inline data for Homa */
-	bool inline_data = nvme_tcp_has_inline_data(req);
+	queue->send_args.completion_cookie = 0;
+	queue->send_args.id = 0;
+	queue->send_args.flags = HOMA_SENDMSG_PRIVATE;
+	msg.msg_control = &queue->send_args;
+	msg.msg_controllen = sizeof(queue->send_args);
+	// Not interested FOR NOW
+	// bool inline_data = nvme_tcp_has_inline_data(req);
 	/* We don't cater for hdgst */
 	// u8 hdgst = nvme_tcp_hdgst_len(queue);
 	int len = sizeof(*pdu);
 	int ret;
 
-	/* Not interested */
+	/* Not interested FOR NOW */
 	// if (inline_data || nvme_tcp_queue_more(queue))
 	// 	msg.msg_flags |= MSG_MORE;
 	// else
@@ -1215,6 +1196,8 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
 	ret = sock_sendmsg(queue->sock, &msg);
 	if (ret < 0)
 		return ret;
+	// Set the desired resp RPC ID
+	queue->recv_args.id = queue->send_args.id;
 	nvme_tcp_done_send_req(queue);
 	printk("successfully sent out a cmd pdu.\n");
 	return 1;
@@ -1357,18 +1340,54 @@ out:
 
 static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
 {
-	pr_warn("nvme_tcp_try_recv() is just a prototype now.\n");
-	return -ENOTSUPP;
-	// struct socket *sock = queue->sock;
-	// struct sock *sk = sock->sk;
+	struct socket *sock = queue->sock;
+	struct sock *sk = sock->sk;
+	//size_t consumed = len;
+	int result = -EFAULT;
+
+	if (unlikely(!queue->rd_enabled))
+		return result;
+
+	while (true) {
+		switch (nvme_tcp_recv_state(queue)) {
+		case NVME_TCP_RECV_PDU:
+			result = nvme_tcp_recv_pdu(queue);
+			break;
+		case NVME_TCP_RECV_DATA:
+			//result = nvme_tcp_recv_data(queue, skb, &offset, &len);
+			break;
+		case NVME_TCP_RECV_DDGST:
+			//result = nvme_tcp_recv_ddgst(queue, skb, &offset, &len);
+			break;
+		default:
+			result = -EFAULT;
+		}
+		if (result) {
+			dev_err(queue->ctrl->ctrl.device,
+				"receive failed:  %d\n", result);
+			queue->rd_enabled = false;
+			nvme_tcp_error_recovery(&queue->ctrl->ctrl);
+			return result;
+		}
+	}
+
+	return result;
+	// //Switch this to recvmsg logic, dragging out recv_skb logic
+	// // Not usable
 	// read_descriptor_t rd_desc;
+	// // This should be the return value of recvmsg() inside per lowest level method
 	// int consumed;
-	//
+	// // Not usable
 	// rd_desc.arg.data = queue;
+	// // Not usable
 	// rd_desc.count = 1;
+	// // No need to lock
 	// lock_sock(sk);
+	// // What is this?
 	// queue->nr_cqe = 0;
+	// // Return value determined by ifferent cases in recv_skb
 	// consumed = sock->ops->read_sock(sk, &rd_desc, nvme_tcp_recv_skb);
+	// // No need to lock
 	// release_sock(sk);
 	// return consumed;
 }
@@ -1489,7 +1508,7 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 	mutex_destroy(&queue->queue_lock);
 }
 
-static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
+static int nvme_homa_init_connection(struct nvme_tcp_queue *queue)
 {
 	struct nvme_tcp_icreq_pdu *icreq;
 	struct nvme_tcp_icresp_pdu *icresp;
@@ -1518,28 +1537,40 @@ static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
 	icreq->pfv = cpu_to_le16(NVME_TCP_PFV_1_0);
 	icreq->maxr2t = 0; /* single inflight r2t supported */
 	icreq->hpda = 0; /* no alignment constraint */
-	if (queue->hdr_digest)
-		icreq->digest |= NVME_TCP_HDR_DIGEST_ENABLE;
-	if (queue->data_digest)
-		icreq->digest |= NVME_TCP_DATA_DIGEST_ENABLE;
+	/* For this project these are not concerns. */
+	// if (queue->hdr_digest)
+	icreq->digest = 0;
+	// if (queue->data_digest)
+	icreq->digest = 0;
 
 	iov.iov_base = icreq;
 	iov.iov_len = sizeof(*icreq);
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
+	msg.msg_control = &queue->send_args;
+	msg.msg_controllen = sizeof(queue->send_args);
+	// Any time when sending a req set id and cc to 0
+	queue->send_args.id = 0;
+	queue->send_args.completion_cookie = 0;
+
 	ret = kernel_sendmsg(queue->sock, &msg, &iov, 1, iov.iov_len);
 	if (ret < 0) {
-		pr_warn("queue %d: failed to send icreq, error %d\n",
+		pr_warn("queue %d: failed to send icreq using Homa, error %d\n",
 			nvme_tcp_queue_id(queue), ret);
 		goto free_icresp;
 	}
-
+	queue->recv_args.id = queue->send_args.id;
 	memset(&msg, 0, sizeof(msg));
 	iov.iov_base = icresp;
 	iov.iov_len = sizeof(*icresp);
-	if (nvme_tcp_queue_tls(queue)) {
-		msg.msg_control = cbuf;
-		msg.msg_controllen = sizeof(cbuf);
-	}
-	msg.msg_flags = MSG_WAITALL;
+	/* Homa does not use TLS, this is not interested. */
+	// if (nvme_tcp_queue_tls(queue)) {
+	// 	msg.msg_control = cbuf;
+	// 	msg.msg_controllen = sizeof(cbuf);
+	// }
+	msg.msg_control = &queue->recv_args;
+	msg.msg_controllen = sizeof(queue->recv_args);
+	msg.msg_flags = 0; // use blocking recv
 	ret = kernel_recvmsg(queue->sock, &msg, &iov, 1,
 			iov.iov_len, msg.msg_flags);
 	if (ret >= 0 && ret < sizeof(*icresp))
@@ -1550,16 +1581,19 @@ static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
 		goto free_icresp;
 	}
 	ret = -ENOTCONN;
-	if (nvme_tcp_queue_tls(queue)) {
-		ctype = tls_get_record_type(queue->sock->sk,
-					    (struct cmsghdr *)cbuf);
-		if (ctype != TLS_RECORD_TYPE_DATA) {
-			pr_err("queue %d: unhandled TLS record %d\n",
-			       nvme_tcp_queue_id(queue), ctype);
-			goto free_icresp;
-		}
-	}
+	// if (nvme_tcp_queue_tls(queue)) {
+	// 	ctype = tls_get_record_type(queue->sock->sk,
+	// 				    (struct cmsghdr *)cbuf);
+	// 	if (ctype != TLS_RECORD_TYPE_DATA) {
+	// 		pr_err("queue %d: unhandled TLS record %d\n",
+	// 		       nvme_tcp_queue_id(queue), ctype);
+	// 		goto free_icresp;
+	// 	}
+	// }
 	ret = -EINVAL;
+	// Copy PDU from buffer to icresp， icresp in buffer will be released when
+	// next recvmsg() is called
+	memcpy(&icresp, queue->rcvbuf_args.start, sizeof(icresp));
 	if (icresp->hdr.type != nvme_tcp_icresp) {
 		pr_err("queue %d: bad type returned %d\n",
 			nvme_tcp_queue_id(queue), icresp->hdr.type);
@@ -1813,6 +1847,15 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 
 	ret = sock_create(ctrl->addr.ss_family, SOCK_DGRAM,
 			IPPROTO_HOMA, &queue->sock);
+	int buffer_pool_size = 32 * 1024 * 1024; // 32 MB buffer pool
+	void *buffer_pool = vmalloc(buffer_pool_size);
+	if (!buffer_pool) {
+		dev_err("cannot allocate buffer pool for NVMe/Homa host ctrl");
+		return -ENOMEM;
+	}
+	memset(queue->rcvbuf_args, 0, sizeof(queue->rcvbuf_args));
+	queue->rcvbuf_args.start = (__u64) buffer_pool;
+	queue->rcvbuf_args.length = buffer_pool_size;
 	if (ret) {
 		dev_err(nctrl->device,
 			"failed to create socket: %d\n", ret);
@@ -1824,7 +1867,6 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 		ret = PTR_ERR(sock_file);
 		goto err_destroy_mutex;
 	}
-	nvme_tcp_reclassify_socket(queue->sock);
 
 	/* Single syn retry, don't need it for Homa */
 	//tcp_sock_set_syncnt(queue->sock->sk, 1);
@@ -1873,7 +1915,14 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 			goto err_sock;
 		}
 	}
-
+	// If host side socks are not bound, we have to set them to server mode
+	// for recvmsg().
+	else {
+		int server_enable = 1;
+		sockptr_t optval = KERNEL_SOCKPTR(&server_enable);
+		sock_setsockopt(queue->sock, IPPROTO_HOMA, SO_HOMA_SERVER, optval, sizeof(optval));
+		nvme_tcp_reclassify_socket(queue->sock);
+	}
 	if (nctrl->opts->mask & NVMF_OPT_HOST_IFACE) {
 		dev_info(nctrl->device, "Homa does not support SO_BINDTODEVICE, ignoring host_iface=%s\n",
 		 nctrl->opts->host_iface);
@@ -1919,17 +1968,17 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 	// 		goto err_init_connect;
 	// }
 
-	/* For Homa's RPC model, we don't need icreq and icresp. */
-	// ret = nvme_tcp_init_connection(queue);
-	// if (ret)
-	// 	goto err_init_connect;
+	/* This is actually needed for negotiating params between h and t */
+	ret = nvme_homa_init_connection(queue);
+	if (ret)
+		goto err_init_connect;
 
 	set_bit(NVME_TCP_Q_ALLOCATED, &queue->flags);
 	printk("Homa socket successfully connected to the target addr.\n");
 	return 0;
 
-// err_init_connect:
-// 	kernel_sock_shutdown(queue->sock, SHUT_RDWR);
+err_init_connect:
+ 	kernel_sock_shutdown(queue->sock, SHUT_RDWR);
 err_rcv_pdu:
 	kfree(queue->pdu);
 err_crypto:
